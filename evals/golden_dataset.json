@@ -1,0 +1,12 @@
+[
+    {
+        "query": "What did I research about Java yesterday?",
+        "expected_events": ["event-id-1", "event-id-2"],
+        "expected_answer_contains": "Java 8 vs Java 15"
+    },
+    {
+        "query": "Find my session on debugging Postgres performance",
+        "expected_events": ["event-id-3"],
+        "expected_answer_contains": "pg_stat_statements"
+    }
+]
