@@ -1058,7 +1058,7 @@ export default function DashboardPage() {
                 {recentInvs.slice(0, 5).map((inv) => (
                   <div key={inv.id} className="list-item">
                     <div className="item-header">
-                      <span className="item-title" style={{ color: "#38bdf8" }}>"{inv.query}"</span>
+                      <span className="item-title" style={{ color: "#38bdf8" }}>&ldquo;{inv.query}&rdquo;</span>
                       <span className="item-meta">{inv.status}</span>
                     </div>
                     <div className="item-desc" style={{ fontSize: "0.8rem" }}>

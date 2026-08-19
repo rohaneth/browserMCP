@@ -72,6 +72,12 @@ def execute_investigate(question: str) -> Dict[str, Any]:
     """
     db = get_db_session()
     try:
+        try:
+            from services.sync_log import sync_events_log_to_db
+            sync_events_log_to_db()
+        except Exception:
+            pass
+
         # Ensure sessionization is up to date
         try:
             assign_unassigned_events_to_sessions(db)

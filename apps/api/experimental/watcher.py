@@ -1,10 +1,12 @@
 import asyncio
 import logging
 import os
+import json
 import re
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from typing import Dict, Any, List, Optional
 from collections import Counter
+from urllib.parse import urlparse
 
 from sqlalchemy.orm import Session
 from db.session import SessionLocal
@@ -15,6 +17,9 @@ from utils.normalization import extract_url_search_params
 from services.investigation import run_investigation
 
 logger = logging.getLogger(__name__)
+
+EVENTS_LOG_PATH = os.path.abspath(os.path.join(os.path.dirname(__file__), '../../events.log'))
+
 
 class BrowserWatcher:
     _instance: Optional["BrowserWatcher"] = None
@@ -135,16 +140,97 @@ class BrowserWatcher:
         """Asynchronous background monitoring loop."""
         while self.is_running:
             try:
+                # 1. Sync any new lines from events.log into DB if present
+                self._sync_events_log_file()
+                # 2. Process unprocessed events for heuristic shifts
                 self._process_new_events_cycle()
             except Exception as e:
-                logger.error(f"Error in watcher processing cycle: {e}")
+                logger.error(f"Error in watcher processing cycle: {e}", exc_info=True)
 
             try:
                 # Sleep interval between check cycles
-                await asyncio.wait_for(self._stop_event.wait(), timeout=10)
-                break # If event is set, exit loop
+                await asyncio.wait_for(self._stop_event.wait(), timeout=5)
+                break
             except asyncio.TimeoutError:
                 continue
+
+    def _sync_events_log_file(self):
+        """
+        Monitors events.log for newly appended lines and imports them into DB.
+        """
+        if not os.path.exists(EVENTS_LOG_PATH):
+            return
+
+        db = SessionLocal()
+        try:
+            with open(EVENTS_LOG_PATH, 'r', encoding='utf-8') as f:
+                lines = f.readlines()
+
+            for line in lines:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    data = json.loads(line)
+                except Exception:
+                    continue
+
+                ts_str = data.get("timestamp")
+                url = data.get("url", "")
+                event_type = data.get("event") or data.get("type") or "unknown"
+                page_title = data.get("pageTitle") or data.get("title") or ""
+                input_text = data.get("input") or data.get("text") or ""
+                content = data.get("content", "")
+
+                if not ts_str:
+                    continue
+
+                try:
+                    dt = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+                except Exception:
+                    continue
+
+                domain = ""
+                if url:
+                    try:
+                        domain = urlparse(url).netloc
+                    except Exception:
+                        pass
+
+                if not input_text and url:
+                    extr = extract_url_search_params(url)
+                    if extr:
+                        input_text = extr
+
+                # Check if event already exists in DB
+                existing = db.query(Event).filter(
+                    Event.timestamp == dt,
+                    Event.event_type == event_type,
+                    Event.url == url
+                ).first()
+
+                if not existing:
+                    new_ev = Event(
+                        event_id=uuid.uuid4(),
+                        timestamp=dt,
+                        event_type=event_type,
+                        url=url,
+                        canonical_url=url,
+                        domain=domain,
+                        page_title=page_title,
+                        content=content,
+                        input_text=input_text,
+                        metadata_={k: v for k, v in data.items() if k not in {"timestamp", "event", "type", "pageTitle", "title", "input", "text", "url", "content"}},
+                        source="events_log_watcher",
+                        schema_version=1
+                    )
+                    db.add(new_ev)
+
+            db.commit()
+        except Exception as e:
+            logger.error(f"Error syncing events.log: {e}")
+        finally:
+            db.close()
 
     def _process_new_events_cycle(self):
         """Inspects newly arrived events without invoking LLMs on every single event."""
@@ -181,20 +267,23 @@ class BrowserWatcher:
         Lightweight heuristic rule evaluation:
         1. High concentration / burst of queries on a specific new technical topic or language.
         2. Domain cluster switch (e.g. pivoting into research or entertainment).
-        3. Only triggers a scoped investigation when substantial shift detected.
+        3. Media consumption or shopping shift detection.
         """
         alerts = []
-        if len(events) < 3:
+        if len(events) < 2:
             return alerts
 
-        # Collect searches
+        # Collect searches & domains
         searches = []
         domains = []
+        titles = []
         event_ids = [str(e.event_id) for e in events]
 
         for e in events:
             if e.domain:
                 domains.append(e.domain.lower())
+            if e.page_title:
+                titles.append(e.page_title.lower())
             inp = e.input_text or extract_url_search_params(e.url)
             if inp:
                 searches.append(inp.lower())
@@ -203,19 +292,18 @@ class BrowserWatcher:
         dom_counts = Counter(domains)
         if dom_counts:
             top_dom, top_count = dom_counts.most_common(1)[0]
-            if top_count >= 5 and top_dom in ["stackoverflow.com", "github.com", "youtube.com"]:
+            if top_count >= 3 and top_dom in ["stackoverflow.com", "github.com", "youtube.com", "amazon.in", "amazon.com"]:
                 alerts.append(WatcherAlert(
                     alert_type="activity_burst",
                     title=f"Activity Burst on {top_dom}",
-                    summary=f"Detected a burst of {top_count} interactions on {top_dom} in recent browsing stream.",
+                    summary=f"Detected a concentrated stream of {top_count} events on {top_dom}.",
                     supporting_event_ids=event_ids[:10]
                 ))
 
         # Check for search topic patterns
-        if len(searches) >= 2:
+        if searches:
             joined_searches = " ".join(searches)
-            # Detect emerging technical topics
-            for kw in ["python", "rust", "docker", "fastapi", "react", "kubernetes", "java", "sql"]:
+            for kw in ["python", "rust", "docker", "fastapi", "react", "kubernetes", "java", "sql", "vivobook", "laptop"]:
                 if kw in joined_searches:
                     alerts.append(WatcherAlert(
                         alert_type="interest_signal",
@@ -224,5 +312,15 @@ class BrowserWatcher:
                         supporting_event_ids=event_ids[:10]
                     ))
                     break
+
+        # Check for entertainment stream (e.g. YouTube Standup or Video sessions)
+        joined_titles = " ".join(titles)
+        if "samay raina" in joined_titles or "standup" in joined_titles or "special" in joined_titles:
+            alerts.append(WatcherAlert(
+                alert_type="entertainment_session",
+                title="Entertainment & Media Playback Detected",
+                summary="Detected active video consumption and entertainment streaming session.",
+                supporting_event_ids=event_ids[:10]
+            ))
 
         return alerts

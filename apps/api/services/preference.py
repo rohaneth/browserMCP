@@ -1,12 +1,15 @@
 import re
+import difflib
 import logging
 from typing import Dict, Any, List, Tuple, Optional
+from collections import Counter
 from sqlalchemy.orm import Session
 from sqlalchemy import or_, and_, func
 
 from models.events import Event
 from schemas.search import Evidence
 from utils.normalization import extract_url_search_params
+from utils.fuzzy import normalize_string, extract_fuzzy_keywords, find_entity_matches_in_text
 
 logger = logging.getLogger(__name__)
 
@@ -17,28 +20,61 @@ LANGUAGES = [
     "html", "css", "assembly", "scala", "dart", "r", "julia"
 ]
 
+KNOWN_ART_FORMS = [
+    ("music", ["ukulele", "guitar", "instrument", "song", "headphones", "sound quality", "music", "spotify"]),
+    ("literature", ["book", "books", "author", "authors", "novel", "novels", "goodreads", "camus", "nietzsche", "osho", "krishnamurti", "dostoevsky"]),
+    ("film", ["movie", "movies", "film", "cinema", "thriller", "plot", "actor", "director", "cinematography"]),
+    ("theatre & comedy", ["standup", "comedy show", "theatre", "theater", "comedy special", "roast"]),
+    ("visual arts", ["painting", "drawing", "illustration", "sculpture", "sketch", "design"]),
+    ("dance", ["dance", "ballet", "choreography"])
+]
+
+KNOWN_PHILOSOPHICAL_TRADITIONS = [
+    ("Existentialism / Absurdism", ["camus", "nietzsche", "meaning of life", "the stranger", "absurd", "existential"]),
+    ("Eastern Philosophy / Self-Inquiry", ["osho", "krishnamurti", "observer is the observed", "meditation", "awareness", "zen", "buddhis"]),
+    ("Ethics & Moral Philosophy", ["morality", "free will", "sam harris", "ethics", "moral"]),
+    ("Philosophy of Science / Rationalism", ["demon-haunted world", "sagan", "rational", "bayes", "epistemology"])
+]
+
 
 def detect_preference_category(query: str) -> Optional[str]:
-    q_lower = query.lower()
+    q_norm = normalize_string(query)
 
-    if any(k in q_lower for k in ["programming language", "coding language", "preferred language", "language is my favourite", "language do i use", "language do i like"]):
-        return "programming_language"
+    # Typo-tolerant category keywords
+    if any(k in q_norm for k in ["art form", "artform", "form of art", "which art", "arts"]):
+        return "art_form"
 
-    if any(k in q_lower for k in ["comedian", "standup", "stand-up", "comedy show"]):
+    if any(k in q_norm for k in ["author", "authors", "writer", "writers", "novelist", "book", "books"]):
+        return "authors_literature"
+
+    if any(k in q_norm for k in ["philosoph", "tradition", "existential", "philosophy"]):
+        return "philosophy"
+
+    # Handle typos: 'langauge', 'progrmming', 'code', etc.
+    if any(k in q_norm for k in ["programming language", "coding language", "preferred language", "language", "langauge", "coding"]):
+        if any(w in q_norm for w in ["favourite", "favorite", "like", "prefer", "best", "use"]):
+            return "programming_language"
+
+    if any(k in q_norm for k in ["comedian", "standup", "stand up", "comedy show", "comic"]):
         return "comedian"
 
-    if any(k in q_lower for k in ["movie", "movies", "kind of movies", "shows", "cinema"]):
-        return "movies_entertainment"
+    if any(k in q_norm for k in ["movie", "movies", "kind of movies", "shows", "cinema", "film"]):
+        if any(w in q_norm for w in ["favourite", "favorite", "like", "prefer", "best"]):
+            return "movies_entertainment"
 
-    if any(k in q_lower for k in ["topic", "topics", "interested in", "interests", "hobbies", "research"]):
+    if any(k in q_norm for k in ["topic", "topics", "interested in", "interests", "hobbies", "research"]):
         return "topics_interests"
 
-    if any(k in q_lower for k in ["favourite", "favorite", "like most", "preferred"]):
-        if "language" in q_lower or "code" in q_lower or "tech" in q_lower:
+    if any(k in q_norm for k in ["favourite", "favorite", "like most", "preferred"]):
+        if any(w in q_norm for w in ["language", "langauge", "code", "tech", "coding"]):
             return "programming_language"
-        if "comedian" in q_lower or "funny" in q_lower:
+        if "art" in q_norm:
+            return "art_form"
+        if "author" in q_norm or "book" in q_norm:
+            return "authors_literature"
+        if "comedian" in q_norm or "funny" in q_norm:
             return "comedian"
-        if "movie" in q_lower or "film" in q_lower or "video" in q_lower:
+        if "movie" in q_norm or "film" in q_norm or "video" in q_norm:
             return "movies_entertainment"
         return "general_preference"
 
@@ -203,6 +239,145 @@ def infer_entertainment_preference(db: Session) -> Tuple[Dict[str, Any], List[Ev
         "count": top_count,
         "confidence": "LIKELY" if top_count >= 2 else "UNKNOWN",
         "all_candidates": dict(sorted_candidates[:5])
+    }
+
+    return summary_data, supporting_events.get(top_candidate, [])
+
+
+def infer_art_form_preference(db: Session) -> Tuple[Dict[str, Any], List[Event]]:
+    """
+    Scans entire database to evaluate user engagement across distinct art forms
+    (Literature, Music, Film, Theatre, Visual Arts) based on searches, titles, and media events.
+    """
+    all_events = db.query(Event).all()
+    form_scores: Dict[str, float] = {}
+    supporting_events: Dict[str, List[Event]] = {}
+    candidate_queries: Dict[str, List[str]] = {}
+
+    for e in all_events:
+        search_txt = f"{e.input_text or ''} {extract_url_search_params(e.url) or ''}".lower()
+        title_txt = (e.page_title or '').lower()
+
+        for form_name, keywords in KNOWN_ART_FORMS:
+            matched = False
+            for kw in keywords:
+                if kw in search_txt or kw in title_txt:
+                    matched = True
+                    break
+            if matched:
+                form_scores[form_name] = form_scores.get(form_name, 0.0) + (3.0 if (e.input_text or extract_url_search_params(e.url)) else 1.0)
+                if form_name not in supporting_events:
+                    supporting_events[form_name] = []
+                supporting_events[form_name].append(e)
+
+                inp = e.input_text or extract_url_search_params(e.url)
+                if inp:
+                    if form_name not in candidate_queries: candidate_queries[form_name] = []
+                    if inp not in candidate_queries[form_name]: candidate_queries[form_name].append(inp)
+
+    if not form_scores:
+        return {"top_candidate": None, "confidence": "UNKNOWN", "candidates": {}}, []
+
+    sorted_candidates = sorted(form_scores.items(), key=lambda x: x[1], reverse=True)
+    top_candidate, top_score = sorted_candidates[0]
+    top_events = supporting_events.get(top_candidate, [])
+
+    summary_data = {
+        "top_candidate": top_candidate.capitalize(),
+        "score": round(top_score, 1),
+        "count": len(top_events),
+        "confidence": "LIKELY" if top_score >= 3.0 else "UNKNOWN",
+        "queries": candidate_queries.get(top_candidate, [])[:6],
+        "all_candidates": {k.capitalize(): round(v, 1) for k, v in sorted_candidates}
+    }
+
+    return summary_data, top_events
+
+
+def infer_authors_literature_preference(db: Session) -> Tuple[Dict[str, Any], List[Event]]:
+    """
+    Discovers authors and literary figures mentioned across search queries, titles, and book pages.
+    """
+    all_events = db.query(Event).all()
+    author_counts: Dict[str, int] = {}
+    supporting_events: Dict[str, List[Event]] = {}
+    candidate_queries: Dict[str, List[str]] = {}
+
+    potential_figures = [
+        "Camus", "Nietzsche", "Osho", "J. Krishnamurti", "Krishnamurti",
+        "Carl Sagan", "Sam Harris", "Fyodor Dostoevsky", "Dostoevsky", "Franz Kafka", "Kafka",
+        "George Orwell", "Orwell", "Marcus Aurelius", "Haruki Murakami"
+    ]
+
+    for e in all_events:
+        text = f"{e.input_text or ''} {extract_url_search_params(e.url) or ''} {e.page_title or ''}".lower()
+        for fig in potential_figures:
+            if fig.lower() in text:
+                disp = "J. Krishnamurti" if "krishnamurti" in fig.lower() else ("Albert Camus" if "camus" in fig.lower() else ("Friedrich Nietzsche" if "nietzsche" in fig.lower() else fig))
+                author_counts[disp] = author_counts.get(disp, 0) + 1
+                if disp not in supporting_events:
+                    supporting_events[disp] = []
+                supporting_events[disp].append(e)
+
+                inp = e.input_text or extract_url_search_params(e.url)
+                if inp:
+                    if disp not in candidate_queries: candidate_queries[disp] = []
+                    if inp not in candidate_queries[disp]: candidate_queries[disp].append(inp)
+
+    if not author_counts:
+        return {"top_candidate": None, "confidence": "UNKNOWN", "candidates": {}}, []
+
+    sorted_candidates = sorted(author_counts.items(), key=lambda x: x[1], reverse=True)
+    top_candidate, top_count = sorted_candidates[0]
+    top_events = supporting_events.get(top_candidate, [])
+
+    summary_data = {
+        "top_candidate": top_candidate,
+        "count": top_count,
+        "confidence": "LIKELY" if top_count >= 1 else "UNKNOWN",
+        "queries": candidate_queries.get(top_candidate, []),
+        "all_candidates": dict(sorted_candidates[:5])
+    }
+
+    return summary_data, top_events
+
+
+def infer_philosophy_preference(db: Session) -> Tuple[Dict[str, Any], List[Event]]:
+    """
+    Evaluates philosophical topics, inquiries, and traditions present in user searches.
+    """
+    all_events = db.query(Event).all()
+    trad_counts: Dict[str, int] = {}
+    supporting_events: Dict[str, List[Event]] = {}
+    candidate_queries: Dict[str, List[str]] = {}
+
+    for e in all_events:
+        text = f"{e.input_text or ''} {extract_url_search_params(e.url) or ''} {e.page_title or ''}".lower()
+        for trad_name, keywords in KNOWN_PHILOSOPHICAL_TRADITIONS:
+            matched = any(kw in text for kw in keywords)
+            if matched:
+                trad_counts[trad_name] = trad_counts.get(trad_name, 0) + 1
+                if trad_name not in supporting_events:
+                    supporting_events[trad_name] = []
+                supporting_events[trad_name].append(e)
+
+                inp = e.input_text or extract_url_search_params(e.url)
+                if inp:
+                    if trad_name not in candidate_queries: candidate_queries[trad_name] = []
+                    if inp not in candidate_queries[trad_name]: candidate_queries[trad_name].append(inp)
+
+    if not trad_counts:
+        return {"top_candidate": None, "confidence": "UNKNOWN", "candidates": {}}, []
+
+    sorted_candidates = sorted(trad_counts.items(), key=lambda x: x[1], reverse=True)
+    top_candidate, top_count = sorted_candidates[0]
+
+    summary_data = {
+        "top_candidate": top_candidate,
+        "count": top_count,
+        "confidence": "LIKELY" if top_count >= 2 else "UNKNOWN",
+        "queries": candidate_queries.get(top_candidate, [])[:6],
+        "all_candidates": dict(sorted_candidates)
     }
 
     return summary_data, supporting_events.get(top_candidate, [])

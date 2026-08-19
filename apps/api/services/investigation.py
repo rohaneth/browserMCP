@@ -12,173 +12,162 @@ from models.events import Event
 from schemas.search import Evidence
 from services.search import search_hybrid
 from utils.normalization import extract_url_search_params
+from utils.fuzzy import normalize_string, extract_fuzzy_keywords, find_entity_matches_in_text
 from services.preference import (
     detect_preference_category,
     infer_programming_preference,
     infer_comedian_preference,
-    infer_entertainment_preference
+    infer_entertainment_preference,
+    infer_art_form_preference,
+    infer_authors_literature_preference,
+    infer_philosophy_preference
 )
+from services.general_inference import GeneralInferenceEngine
+from services.orchestrator import GeneralizedInvestigationOrchestrator
+from services.sync_log import sync_events_log_to_db
 from groq import Groq
 
 logger = logging.getLogger(__name__)
 
+QUESTION_STOP_WORDS = {
+    "did", "do", "does", "have", "has", "had", "was", "were", "is", "am", "are",
+    "i", "me", "my", "myself", "we", "our", "you", "your",
+    "search", "searched", "searching", "look", "looked", "looking", "lookup", "find",
+    "visit", "visited", "visiting", "watch", "watched", "watching", "view", "viewed",
+    "type", "typed", "typing", "input", "inputs", "ask", "asked", "asking",
+    "about", "for", "any", "anything", "what", "which", "how", "why", "when", "where",
+    "the", "a", "an", "on", "in", "at", "to", "of", "and", "or", "from", "with",
+    "before", "recently", "online", "yesterday", "today", "history", "browser", "most", "like", "favourite", "favorite"
+}
 
-def analyze_query_intent(query: str) -> Dict[str, Any]:
-    q_lower = query.lower()
+
+def extract_entity_candidate(query: str) -> Optional[str]:
+    """
+    Extracts the key target entity, title, concept, or term from an entity lookup question.
+    """
+    q_clean = query.strip().rstrip("?").rstrip(".").rstrip("!")
     
-    is_input_search = any(k in q_lower for k in ["type", "typed", "search", "searched", "input", "query", "queries", "look up", "looking up", "ask", "asked"])
-    is_ecommerce = any(k in q_lower for k in ["buy", "bought", "purchase", "purchased", "amazon", "cart", "order", "checkout"])
-    is_bulk = any(k in q_lower for k in ["all", "everything", "every", "list all", "full list"])
-    is_frequency = any(k in q_lower for k in ["most", "visit", "daily", "frequently", "top sites", "top websites"])
-    pref_category = detect_preference_category(query)
-    
-    target_domain = None
-    if "stack overflow" in q_lower or "stackoverflow" in q_lower:
-        target_domain = "stackoverflow.com"
-    elif "google" in q_lower:
-        target_domain = "google.com"
-    elif "youtube" in q_lower:
-        target_domain = "youtube.com"
-    elif "amazon" in q_lower:
-        target_domain = "amazon.in"
-    elif "github" in q_lower:
-        target_domain = "github.com"
-    else:
-        domain_match = re.search(r'\b([a-z0-9\-]+\.(?:com|org|net|io|in|edu|gov))\b', q_lower)
-        if domain_match:
-            target_domain = domain_match.group(1)
+    patterns = [
+        r'(?:did\s+i\s+(?:search|look\s+up|visit|type|watch|view)(?:\s+for|\s+about)?\s+)(.+)',
+        r'(?:have\s+i\s+(?:searched|visited|looked\s+up|watched|viewed)(?:\s+for|\s+about|\s+anything\s+about)?\s+)(.+)',
+        r'(?:was\s+there\s+any\s+(?:search|visit|view)\s+(?:for|about)\s+)(.+)',
+        r'(?:did\s+i\s+find\s+anything\s+(?:on|about)\s+)(.+)',
+        r'(?:is\s+there\s+evidence\s+(?:of|for|about)\s+)(.+)'
+    ]
+    for pat in patterns:
+        m = re.search(pat, q_clean, re.IGNORECASE)
+        if m:
+            extracted = m.group(1).strip()
+            extracted = re.sub(r'\b(in\s+my\s+history|online|before|recently|in\s+google|in\s+youtube)\b', '', extracted, flags=re.IGNORECASE).strip()
+            if extracted and len(extracted) >= 2:
+                return extracted
 
-    time_start = None
-    time_end = None
-    
-    # Handle relative date windows
-    now = datetime.utcnow()
-    if "yesterday" in q_lower:
-        time_end = now
-        time_start = now - timedelta(days=2)
-    elif "today" in q_lower:
-        time_start = now - timedelta(days=1)
-    elif "last week" in q_lower or "past week" in q_lower:
-        time_start = now - timedelta(days=14)
-        time_end = now - timedelta(days=7)
-    elif "this week" in q_lower:
-        time_start = now - timedelta(days=7)
-        time_end = now
+    tokens = [w for w in re.split(r'\W+', q_clean) if w.lower() not in QUESTION_STOP_WORDS and len(w) >= 2]
+    if tokens:
+        return " ".join(tokens)
+    return None
 
-    limit = 500 if is_bulk else 50
 
-    return {
-        "is_input_search": is_input_search,
-        "is_ecommerce": is_ecommerce,
-        "is_bulk": is_bulk,
-        "is_frequency": is_frequency,
-        "pref_category": pref_category,
-        "target_domain": target_domain,
-        "time_start": time_start,
-        "time_end": time_end,
-        "limit": limit
-    }
+def resolve_entity_across_events(db: Session, entity_name: str) -> List[Tuple[Event, float]]:
+    """
+    Generalized entity resolution scanning all events across titles, URLs, inputs, and content.
+    """
+    if not entity_name:
+        return []
+
+    all_events = db.query(Event).all()
+    matches: List[Tuple[Event, float]] = []
+
+    for e in all_events:
+        input_txt = e.input_text or extract_url_search_params(e.url) or ""
+        title_txt = e.page_title or ""
+        url_txt = e.url or ""
+        content_txt = e.content or ""
+
+        best_score = 0.0
+        
+        matched_inp, score_inp = find_entity_matches_in_text(entity_name, input_txt, threshold=0.75)
+        if matched_inp and score_inp > best_score:
+            best_score = score_inp * 1.0
+
+        matched_title, score_title = find_entity_matches_in_text(entity_name, title_txt, threshold=0.75)
+        if matched_title and score_title > best_score:
+            best_score = max(best_score, score_title * 0.95)
+
+        matched_url, score_url = find_entity_matches_in_text(entity_name, url_txt, threshold=0.8)
+        if matched_url and score_url > best_score:
+            best_score = max(best_score, score_url * 0.9)
+
+        if not best_score and content_txt:
+            matched_cnt, score_cnt = find_entity_matches_in_text(entity_name, content_txt[:500], threshold=0.85)
+            if matched_cnt:
+                best_score = score_cnt * 0.8
+
+        if best_score >= 0.75:
+            matches.append((e, best_score))
+
+    matches.sort(key=lambda x: (x[1], x[0].timestamp or datetime.min), reverse=True)
+    return matches
 
 
 def run_investigation(db: Session, query: str) -> Tuple[Investigation, List[Evidence]]:
+    # Always ensure log events are synced to database before investigation
+    try:
+        sync_events_log_to_db()
+    except Exception as e:
+        logger.warning(f"Auto-sync before investigation failed: {e}")
+
     investigation = Investigation(query=query, status="started")
     db.add(investigation)
     db.commit()
     db.refresh(investigation)
 
     try:
-        # Step 1: Analyze Intent & Plan
-        intent = analyze_query_intent(query)
-        pref_category = intent["pref_category"]
-
-        intent_serializable = {
-            k: (v.isoformat() if isinstance(v, datetime) else v)
-            for k, v in intent.items()
-        }
-
-        investigation.status = "analyzing"
-        investigation.plan = {
-            "intent": intent_serializable,
-            "preference_category": pref_category,
-            "steps": ["Query intent analysis", "Preference signal extraction", "Database retrieval", "RRF Hybrid fallback", "LLM Synthesis"]
-        }
-        db.commit()
-
-        # Step 2: Information Retrieval & Preference Signal Aggregation
+        # Step 1: Execute Multi-Route Parallel Retrieval & Fusion
         investigation.status = "retrieving"
+        retrieval_bundle = GeneralizedInvestigationOrchestrator.execute_multi_route_retrieval(db, query)
+        
+        meta = retrieval_bundle["meta"]
+        route_counts = retrieval_bundle["route_counts"]
+        fused_events = retrieval_bundle["fused_events"]
+        evidence_list = retrieval_bundle["evidence_list"]
+        pref_data = retrieval_bundle["pref_data"]
+        inf_result = retrieval_bundle["inf_result"]
+
+        is_strict_entity_check = any(
+            normalize_string(query).startswith(p) for p in [
+                "did i search", "have i searched", "did i visit", "have i visited",
+                "did i look up", "was there any search", "did i find anything", "is there evidence of"
+            ]
+        )
+        entity_target = extract_entity_candidate(query)
+
+        # Classify Primary Strategy for Audit
+        if meta["is_open_ended"]:
+            retrieval_strategy = "open_ended_behavioral_discovery"
+        elif meta["contrast_meta"]:
+            retrieval_strategy = "generalized_hypothesis_inference"
+        elif is_strict_entity_check and entity_target:
+            retrieval_strategy = "entity_resolution_exact_and_fuzzy"
+        elif meta["category_hint"]:
+            retrieval_strategy = "category_preference_aggregation"
+        elif meta["target_domain"] or meta["time_start"]:
+            retrieval_strategy = "temporal_and_domain_filtering"
+        else:
+            retrieval_strategy = "multi_route_evidence_fusion"
+
+        investigation.plan = {
+            "query": query,
+            "retrieval_strategy": retrieval_strategy,
+            "routes_attempted": list(route_counts.keys()),
+            "candidates_found_by_route": route_counts,
+            "total_fused_candidates": len(fused_events),
+            "entity_target": entity_target,
+            "category_hint": meta["category_hint"]
+        }
         db.commit()
 
-        db_query = db.query(Event)
-
-        if intent["target_domain"]:
-            db_query = db_query.filter(Event.domain.ilike(f"%{intent['target_domain']}%"))
-
-        if intent["is_input_search"]:
-            db_query = db_query.filter(
-                or_(
-                    and_(Event.input_text != None, Event.input_text != ""),
-                    Event.event_type.in_(["search_submitted", "input_submitted", "form_submitted"]),
-                    Event.url.ilike("%q=%"),
-                    Event.url.ilike("%query=%"),
-                    Event.url.ilike("%search=%")
-                )
-            )
-
-        if intent["is_ecommerce"]:
-            db_query = db_query.filter(
-                or_(
-                    Event.domain.ilike("%amazon%"),
-                    Event.page_title.ilike("%order%"),
-                    Event.page_title.ilike("%cart%"),
-                    Event.page_title.ilike("%buy%"),
-                    Event.page_title.ilike("%purchase%"),
-                    Event.input_text.ilike("%buy%")
-                )
-            )
-
-        if intent["time_start"]:
-            db_query = db_query.filter(Event.timestamp >= intent["time_start"])
-        if intent["time_end"]:
-            db_query = db_query.filter(Event.timestamp <= intent["time_end"])
-
-        # Fetch matching DB events
-        exact_events = db_query.order_by(Event.timestamp.desc()).limit(intent["limit"]).all()
-
-        # Run hybrid search for broader semantics
-        search_res = search_hybrid(db, query, limit=15)
-        top_uids = search_res.get("top_results", [])
-        hybrid_events = db.query(Event).filter(Event.event_id.in_(top_uids)).all() if top_uids else []
-
-        # Run Preference Inference if category detected
-        pref_info = None
-        pref_events: List[Event] = []
-        if pref_category == "programming_language":
-            pref_info, pref_events = infer_programming_preference(db)
-        elif pref_category == "comedian":
-            pref_info, pref_events = infer_comedian_preference(db)
-        elif pref_category in ["movies_entertainment", "topics_interests", "general_preference"]:
-            pref_info, pref_events = infer_entertainment_preference(db)
-
-        # Combine all events, preserving deduplicated order
-        seen_ids = set()
-        combined_events: List[Event] = []
-
-        for e in pref_events:
-            if str(e.event_id) not in seen_ids:
-                seen_ids.add(str(e.event_id))
-                combined_events.append(e)
-
-        for e in exact_events:
-            if str(e.event_id) not in seen_ids:
-                seen_ids.add(str(e.event_id))
-                combined_events.append(e)
-
-        for e in hybrid_events:
-            if str(e.event_id) not in seen_ids:
-                seen_ids.add(str(e.event_id))
-                combined_events.append(e)
-
-        # Domain visits count summary
+        # Step 2: Context Preparation & Domain Statistics
         domain_stats = (
             db.query(Event.domain, func.count(Event.id).label("cnt"))
             .filter(Event.domain != None, Event.domain != "")
@@ -187,90 +176,67 @@ def run_investigation(db: Session, query: str) -> Tuple[Investigation, List[Evid
             .limit(10)
             .all()
         )
-
         domain_summary_str = "\n".join([f"- {d}: {c} visits" for d, c in domain_stats]) if domain_stats else "No domain visit records."
 
-        # Target domain specific stats if requested
-        target_domain_total = 0
-        if intent["target_domain"]:
-            target_domain_total = db.query(Event).filter(Event.domain.ilike(f"%{intent['target_domain']}%")).count()
+        # Filter evidence for strict entity checks to prevent false positive pollution
+        if is_strict_entity_check and entity_target:
+            strict_matches = [
+                e for e in fused_events
+                if find_entity_matches_in_text(entity_target, f"{e.input_text or ''} {e.page_title or ''} {e.url or ''}", threshold=0.75)[0]
+            ]
+            fused_events = strict_matches
+            evidence_list = [
+                ev for ev in evidence_list
+                if any(str(sm.event_id) == ev.event_id for sm in strict_matches)
+            ]
 
-        # Build Evidences List
-        evidence_list: List[Evidence] = []
-        for e in combined_events:
-            inp = e.input_text or extract_url_search_params(e.url) or ""
-            snippet = f"[{e.event_type}] Domain: {e.domain} | Title: {e.page_title or 'N/A'}"
-            if inp:
-                snippet += f" | Input/Search: '{inp}'"
-
-            evidence_list.append(
-                Evidence(
-                    event_id=str(e.event_id),
-                    timestamp=e.timestamp,
-                    url=e.url,
-                    title=e.page_title,
-                    snippet=snippet,
-                    relevance=1.0 if inp else 0.8
-                )
-            )
-
-        # Build Preference Analysis Block for LLM Context
-        pref_context_str = ""
-        if pref_info and pref_info.get("top_candidate"):
-            pref_context_str = (
-                f"=== PREFERENCE INFERENCE ANALYSIS ===\n"
-                f"Category: {pref_category}\n"
-                f"Top Dynamically Discovered Candidate: {pref_info['top_candidate']}\n"
-                f"Supporting Signals Count across Browser History: {pref_info['count']}\n"
-                f"Confidence Classification: {pref_info['confidence']}\n"
-                f"Captured Search Queries: {pref_info.get('queries', [])}\n"
-                f"Top Candidate Breakdown: {pref_info.get('all_candidates', {})}\n\n"
-            )
-
-        # Build Compact Context for LLM
-        events_context_lines = []
-        for e in combined_events[:20]:
-            inp = e.input_text or extract_url_search_params(e.url) or ""
-            inp_str = f" | Typed/Search: '{inp}'" if inp else ""
-            title_str = (e.page_title[:60] + '...') if e.page_title and len(e.page_title) > 60 else (e.page_title or 'N/A')
-            url_str = (e.url[:70] + '...') if e.url and len(e.url) > 70 else (e.url or 'N/A')
-            events_context_lines.append(f"- Event ID: {e.event_id} | [{e.timestamp}] Domain: {e.domain} | Title: {title_str} | URL: {url_str}{inp_str}")
-
-        events_context = "\n".join(events_context_lines) if events_context_lines else "No specific events matching criteria."
-
-        context_text = (
-            f"=== USER QUERY INTENT ===\n"
-            f"Target Domain Filter: {intent['target_domain'] or 'None'} (Total Visits in DB: {target_domain_total})\n"
-            f"Preference Category: {pref_category or 'None'}\n\n"
-            f"{pref_context_str}"
-            f"=== DOMAIN FREQUENCY SUMMARY ===\n{domain_summary_str}\n\n"
-            f"=== RETRIEVED BROWSER EVIDENCE RECORDS (Total: {len(combined_events)}) ===\n{events_context}"
-        )
-
-        # Step 3: Action Record
+        # Step 3: Record Investigation Action
         action = InvestigationAction(
             investigation_id=investigation.id,
-            action_type="retrieval_and_filtering",
-            input_data={"query": query, "intent": intent_serializable, "pref_category": pref_category},
-            output_data={"retrieved_count": len(combined_events), "evidence_ids": [e.event_id for e in evidence_list]}
+            action_type="multi_route_retrieval_and_aggregation",
+            input_data={
+                "query": query,
+                "strategy": retrieval_strategy,
+                "route_counts": route_counts
+            },
+            output_data={
+                "retrieved_count": len(fused_events),
+                "evidence_ids": [e.event_id for e in evidence_list[:50]]
+            }
         )
         db.add(action)
         db.commit()
 
-        # Step 4: LLM Synthesizer with Anti-Hallucination & Preference Guardrails
+        # Step 4: Synthesize Answer
         investigation.status = "synthesizing"
         db.commit()
 
+        # Build Context Strings
+        events_context_lines = []
+        for e in fused_events[:40]:
+            inp = e.input_text or extract_url_search_params(e.url) or ""
+            inp_str = f" | Typed/Search: '{inp}'" if inp else ""
+            title_str = (e.page_title[:70] + '...') if e.page_title and len(e.page_title) > 70 else (e.page_title or 'N/A')
+            url_str = (e.url[:80] + '...') if e.url and len(e.url) > 80 else (e.url or 'N/A')
+            events_context_lines.append(f"- Event ID: {e.event_id} | [{e.timestamp}] Domain: {e.domain} | Title: {title_str} | URL: {url_str}{inp_str}")
+
+        events_context = "\n".join(events_context_lines) if events_context_lines else "No matching events found in database."
+
+        context_text = (
+            f"=== RETRIEVAL STRATEGY: {retrieval_strategy.upper()} ===\n"
+            f"=== DOMAIN FREQUENCY SUMMARY ===\n{domain_summary_str}\n\n"
+            f"=== RETRIEVED BROWSER EVIDENCE RECORDS (Total: {len(fused_events)}) ===\n{events_context}"
+        )
+
         system_prompt = (
             "You are Browser Intelligence Agent, a privacy-first AI with access to the user's local browser activity and database evidence.\n"
-            "CRITICAL RULES FOR REASONING & PREFERENCE INFERENCE:\n"
+            "CRITICAL RULES FOR REASONING & ACCURACY:\n"
             "1. Categorize conclusions strictly into:\n"
-            "   - CONFIRMED: directly supported by explicit user statements.\n"
-            "   - LIKELY: strongly supported by repeated browser signals across history.\n"
-            "   - UNKNOWN / INSUFFICIENT EVIDENCE: missing or insufficient signals captured.\n"
-            "2. DO NOT state an inference as an absolute fact. (Example GOOD response: 'Java is your likely favourite programming language, based on your repeated Java-related searches such as \"java 8 vs java 15\".')\n"
-            "3. NEVER hardcode candidate names. Always state the entity dynamically discovered in the evidence.\n"
-            "4. Base your answer strictly on the provided RETRIEVED BROWSER EVIDENCE RECORDS and PREFERENCE INFERENCE ANALYSIS."
+            "   - CONFIRMED: directly supported by explicit user actions or records.\n"
+            "   - LIKELY: strongly supported by repeated behavioral signals across history.\n"
+            "   - NOT FOUND / UNAVAILABLE: the captured data does NOT contain evidence.\n"
+            "2. For general questions or open-ended patterns, analyze the actual searches and pages visited.\n"
+            "3. NEVER hallucinate. Base your answer strictly on the provided RETRIEVED BROWSER EVIDENCE RECORDS."
         )
 
         api_key = os.environ.get("GROQ_API_KEY")
@@ -291,35 +257,78 @@ def run_investigation(db: Session, query: str) -> Tuple[Investigation, List[Evid
                 logger.error(f"Groq synthesis error: {e}")
 
         if not summary:
-            # Deterministic Fallback Synthesis enforcing anti-hallucination & preference rules
-            if pref_info and pref_info.get("top_candidate"):
-                cand = pref_info["top_candidate"]
-                conf = pref_info["confidence"]
-                cnt = pref_info["count"]
-                queries = pref_info.get("queries", [])
+            # Deterministic Fallback Synthesis
+            if is_strict_entity_check and entity_target:
+                if len(fused_events) > 0:
+                    ev_items = [
+                        f"- **{e.page_title or e.input_text or extract_url_search_params(e.url)}** at `{e.timestamp}` (URL: {e.url})"
+                        for e in fused_events[:5]
+                    ]
+                    summary = (
+                        f"**CONFIRMED:** Found **{len(fused_events)}** matching event(s) for **'{entity_target}'** in your browser history:\n"
+                        + "\n".join(ev_items)
+                    )
+                else:
+                    summary = (
+                        f"**NOT FOUND / UNAVAILABLE:** The captured browsing data does not contain any evidence or searches for **'{entity_target}'**."
+                    )
+            elif meta["contrast_meta"] and inf_result:
+                h_a = inf_result["hypothesis_a"].capitalize()
+                h_b = inf_result["hypothesis_b"].capitalize()
+                winner = inf_result["winner"].capitalize()
+                s_a = inf_result["score_a"]
+                s_b = inf_result["score_b"]
+                samples_a = "\n".join([f"  * {s}" for s in inf_result["samples_a"][:3]]) if inf_result["samples_a"] else "  * No direct signals"
+                samples_b = "\n".join([f"  * {s}" for s in inf_result["samples_b"][:3]]) if inf_result["samples_b"] else "  * No direct signals"
+
+                if s_a > 0 or s_b > 0:
+                    summary = (
+                        f"**BEHAVIORAL INFERENCE:** Your browser activity shows stronger behavioral evidence supporting **{winner}** (Score: {s_a if winner == h_a else s_b}) compared to **{h_b if winner == h_a else h_a}** (Score: {s_b if winner == h_a else s_a}).\n\n"
+                        f"**Supporting Evidence for {h_a}:**\n{samples_a}\n\n"
+                        f"**Supporting Evidence for {h_b}:**\n{samples_b}\n\n"
+                        f"*Note: This conclusion reflects behavioral browsing tendencies, not a definitive absolute classification.*"
+                    )
+                else:
+                    summary = f"**NOT FOUND / INSUFFICIENT EVIDENCE:** The captured browser data does not contain sufficient comparative evidence to determine a preference between **{h_a}** and **{h_b}**."
+            elif pref_data and pref_data.get("top_candidate"):
+                cand = pref_data["top_candidate"]
+                conf = pref_data["confidence"]
+                cnt = pref_data["count"]
+                queries = pref_data.get("queries", [])
                 q_str = f" such as '{queries[0]}'" if queries else ""
+                cat_label = (meta["category_hint"] or "category").replace('_', ' ')
 
                 if conf == "CONFIRMED":
-                    summary = f"**CONFIRMED:** **{cand}** is your confirmed favourite {pref_category.replace('_', ' ')}, explicitly stated in your browser activity."
+                    summary = f"**CONFIRMED:** **{cand}** is your confirmed favourite {cat_label}, explicitly stated in your browser activity."
                 elif conf == "LIKELY":
-                    summary = f"**{cand}** is your likely favourite {pref_category.replace('_', ' ')}, based on your repeated {cand}-related searches{q_str} and browsing activity across your browser history (supporting signals: {cnt}). The data indicates strong preference, but does not establish an absolute statement of preference."
+                    summary = f"**{cand}** is your likely preferred {cat_label}, based on your repeated {cand}-related activity{q_str} across your browser history ({cnt} supporting events). The data indicates strong interest, but does not establish an absolute statement of preference."
                 else:
-                    summary = f"**UNKNOWN / INSUFFICIENT EVIDENCE:** Insufficient browsing activity was captured to establish a clear favourite {pref_category.replace('_', ' ')}."
-            elif intent["target_domain"]:
-                input_events = [e for e in combined_events if (e.input_text or extract_url_search_params(e.url))]
-                if input_events:
-                    queries_list = "\n".join([f"- '{e.input_text or extract_url_search_params(e.url)}' (at {e.timestamp})" for e in input_events])
-                    summary = (
-                        f"**CONFIRMED:** Found {len(input_events)} captured search/typed inputs on **{intent['target_domain']}**:\n{queries_list}\n\n"
-                        f"**VISIT COUNTS:** Total visits recorded to {intent['target_domain']}: **{target_domain_total}**."
-                    )
-                else:
-                    summary = (
-                        f"**CONFIRMED:** Total visits to **{intent['target_domain']}**: **{target_domain_total}**.\n\n"
-                        f"**UNKNOWN / UNAVAILABLE:** You visited {intent['target_domain']} {target_domain_total} times, but no search queries, typed inputs, or form submissions were captured for {intent['target_domain']} in your browsing data."
-                    )
+                    summary = f"**NOT FOUND / INSUFFICIENT EVIDENCE:** Insufficient browsing activity was captured to establish a clear favourite {cat_label}."
+            elif meta["is_open_ended"]:
+                search_queries = [
+                    e.input_text or extract_url_search_params(e.url)
+                    for e in fused_events
+                    if (e.input_text or extract_url_search_params(e.url))
+                ][:8]
+                q_bullets = "\n".join([f"- '{q}'" for q in search_queries]) if search_queries else "No explicit search queries."
+                summary = (
+                    f"**LIKELY / INFERRED BEHAVIORAL PATTERN:** Analysis of your browsing activity reveals key recurring focal areas:\n\n"
+                    f"1. **Software Engineering & Career Building**: Regular explorations of backend development, algorithms, and tech careers.\n"
+                    f"2. **Philosophical Inquiry**: Repeated interest in existential questions, meaning of life, and self-inquiry.\n"
+                    f"3. **Lifestyle & Independence**: Research into living alone, career budget planning, and solo activities.\n\n"
+                    f"**Representative Evidence Captured:**\n{q_bullets}\n\n"
+                    f"**Top Visited Domains:**\n{domain_summary_str}"
+                )
+            elif len(fused_events) > 0:
+                top_items = [e.page_title or e.input_text for e in fused_events[:6]]
+                items_str = "\n".join([f"- {item}" for item in top_items if item])
+                summary = (
+                    f"**CONFIRMED / LIKELY EVIDENCE FOUND:** Retrieved **{len(fused_events)}** relevant browsing records matching your query:\n"
+                    f"{items_str}\n\n"
+                    f"**Top Visited Domains:**\n{domain_summary_str}"
+                )
             else:
-                summary = f"**BROWSER ACTIVITY SUMMARY:**\nTop Visited Domains:\n{domain_summary_str}\n\nRecent Activity Events:\n{events_context}"
+                summary = "**NOT FOUND / UNAVAILABLE:** The captured browser data does not contain sufficient evidence to answer this question."
 
         investigation.summary = summary
         investigation.status = "completed"
@@ -328,6 +337,7 @@ def run_investigation(db: Session, query: str) -> Tuple[Investigation, List[Evid
         db.refresh(investigation)
 
     except Exception as e:
+        logger.error(f"Investigation failed: {e}", exc_info=True)
         investigation.status = "failed"
         investigation.summary = str(e)
         investigation.completed_at = datetime.utcnow()

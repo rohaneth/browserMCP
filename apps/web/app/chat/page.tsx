@@ -271,7 +271,7 @@ export default function ChatPage() {
             <div style={{ textAlign: "center", color: "#64748b", marginTop: "40px" }}>
               <div style={{ fontSize: "3rem", marginBottom: "16px" }}>👋</div>
               <h2>Ask me anything about your browsing history</h2>
-              <p>Try: "What did I type on Stack Overflow?" or "What websites do I visit most?"</p>
+              <p>Try: &ldquo;What did I type on Stack Overflow?&rdquo; or &ldquo;What websites do I visit most?&rdquo;</p>
             </div>
           )}
 

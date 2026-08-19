@@ -2,9 +2,10 @@ import os
 from dotenv import load_dotenv
 load_dotenv(os.path.join(os.path.dirname(__file__), '../../.env'))
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from routes import events, privacy, timeline, search, memory, ws, mcp
+from services.sync_log import sync_events_log_to_db
 
 app = FastAPI(
     title="Browser Agent API",
@@ -20,6 +21,30 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.middleware("http")
+async def auto_sync_events_log_middleware(request: Request, call_next):
+    """
+    Automatically checks if events.log was modified and synchronizes
+    new events into the database on incoming requests.
+    """
+    try:
+        sync_events_log_to_db()
+    except Exception:
+        pass
+    response = await call_next(request)
+    return response
+
+
+@app.on_event("startup")
+def on_startup():
+    """Initial synchronization of events.log on server boot."""
+    try:
+        sync_events_log_to_db(force=True)
+    except Exception:
+        pass
+
 
 app.include_router(ws.router)
 app.include_router(events.router, prefix="/api/v1")
