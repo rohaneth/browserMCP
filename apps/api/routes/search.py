@@ -41,3 +41,21 @@ def get_query_answer(
         answer=answer,
         evidence=evidence_list
     )
+
+@router.get("/investigations/recent")
+def get_recent_investigations(limit: int = 10, db: Session = Depends(get_db)):
+    """
+    Returns recent investigations executed by the system.
+    """
+    from models.investigations import Investigation
+    invs = db.query(Investigation).order_by(Investigation.created_at.desc()).limit(limit).all()
+    return [
+        {
+            "id": str(i.id),
+            "query": i.query,
+            "status": i.status,
+            "summary": i.summary,
+            "created_at": i.created_at.isoformat() if i.created_at else None
+        }
+        for i in invs
+    ]

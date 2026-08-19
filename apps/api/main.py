@@ -4,11 +4,11 @@ load_dotenv(os.path.join(os.path.dirname(__file__), '../../.env'))
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from routes import events, privacy, timeline, search, memory, ws
+from routes import events, privacy, timeline, search, memory, ws, mcp
 
 app = FastAPI(
     title="Browser Agent API",
-    description="API for ingesting and querying browser events.",
+    description="API for ingesting and querying browser events with integrated MCP Server.",
     version="1.0.0",
 )
 
@@ -27,6 +27,15 @@ app.include_router(privacy.router, prefix="/api/v1/privacy")
 app.include_router(timeline.router)
 app.include_router(search.router, prefix="/api/v1")
 app.include_router(memory.router, prefix="/api/v1")
+app.include_router(mcp.router)
+
+# Mount isolated experimental features (Watcher & Self-Discovery)
+try:
+    from routes.experimental import router as experimental_router
+    app.include_router(experimental_router)
+except Exception as e:
+    import logging
+    logging.getLogger(__name__).warning(f"Experimental features disabled or failed to load: {e}")
 
 
 @app.get("/")

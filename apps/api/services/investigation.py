@@ -50,13 +50,20 @@ def analyze_query_intent(query: str) -> Dict[str, Any]:
 
     time_start = None
     time_end = None
+    
+    # Handle relative date windows
+    now = datetime.utcnow()
     if "yesterday" in q_lower:
-        now = datetime.utcnow()
         time_end = now
         time_start = now - timedelta(days=2)
     elif "today" in q_lower:
-        now = datetime.utcnow()
         time_start = now - timedelta(days=1)
+    elif "last week" in q_lower or "past week" in q_lower:
+        time_start = now - timedelta(days=14)
+        time_end = now - timedelta(days=7)
+    elif "this week" in q_lower:
+        time_start = now - timedelta(days=7)
+        time_end = now
 
     limit = 500 if is_bulk else 50
 
@@ -84,9 +91,14 @@ def run_investigation(db: Session, query: str) -> Tuple[Investigation, List[Evid
         intent = analyze_query_intent(query)
         pref_category = intent["pref_category"]
 
+        intent_serializable = {
+            k: (v.isoformat() if isinstance(v, datetime) else v)
+            for k, v in intent.items()
+        }
+
         investigation.status = "analyzing"
         investigation.plan = {
-            "intent": intent,
+            "intent": intent_serializable,
             "preference_category": pref_category,
             "steps": ["Query intent analysis", "Preference signal extraction", "Database retrieval", "RRF Hybrid fallback", "LLM Synthesis"]
         }
@@ -217,12 +229,12 @@ def run_investigation(db: Session, query: str) -> Tuple[Investigation, List[Evid
 
         # Build Compact Context for LLM
         events_context_lines = []
-        for e in combined_events[:50]:
+        for e in combined_events[:20]:
             inp = e.input_text or extract_url_search_params(e.url) or ""
             inp_str = f" | Typed/Search: '{inp}'" if inp else ""
-            title_str = (e.page_title[:80] + '...') if e.page_title and len(e.page_title) > 80 else (e.page_title or 'N/A')
-            url_str = (e.url[:90] + '...') if e.url and len(e.url) > 90 else (e.url or 'N/A')
-            events_context_lines.append(f"- Event ID: {e.event_id} | [{e.timestamp}] Domain: {e.domain} | Type: {e.event_type} | Title: {title_str} | URL: {url_str}{inp_str}")
+            title_str = (e.page_title[:60] + '...') if e.page_title and len(e.page_title) > 60 else (e.page_title or 'N/A')
+            url_str = (e.url[:70] + '...') if e.url and len(e.url) > 70 else (e.url or 'N/A')
+            events_context_lines.append(f"- Event ID: {e.event_id} | [{e.timestamp}] Domain: {e.domain} | Title: {title_str} | URL: {url_str}{inp_str}")
 
         events_context = "\n".join(events_context_lines) if events_context_lines else "No specific events matching criteria."
 
@@ -239,7 +251,7 @@ def run_investigation(db: Session, query: str) -> Tuple[Investigation, List[Evid
         action = InvestigationAction(
             investigation_id=investigation.id,
             action_type="retrieval_and_filtering",
-            input_data={"query": query, "intent": intent, "pref_category": pref_category},
+            input_data={"query": query, "intent": intent_serializable, "pref_category": pref_category},
             output_data={"retrieved_count": len(combined_events), "evidence_ids": [e.event_id for e in evidence_list]}
         )
         db.add(action)
@@ -272,7 +284,7 @@ def run_investigation(db: Session, query: str) -> Tuple[Investigation, List[Evid
                         {"role": "system", "content": system_prompt},
                         {"role": "user", "content": f"User Query: {query}\n\nRetrieved Context:\n{context_text}"}
                     ],
-                    model=os.environ.get("GROQ_MODEL", "groq/compound")
+                    model=os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")
                 )
                 summary = chat_completion.choices[0].message.content
             except Exception as e:

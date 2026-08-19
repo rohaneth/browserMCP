@@ -3,9 +3,10 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
 # Fallback to SQLite so the user can see the UI without Postgres setup
+_default_sqlite_path = os.path.abspath(os.path.join(os.path.dirname(__file__), '../demo.db')).replace('\\', '/')
 DATABASE_URL = os.getenv(
     "DATABASE_URL",
-    "sqlite:///./demo.db",
+    f"sqlite:///{_default_sqlite_path}",
 )
 
 connect_args = {"check_same_thread": False} if DATABASE_URL.startswith("sqlite") else {}
@@ -32,6 +33,11 @@ import models.sessions
 import models.memories
 import models.settings
 import models.investigations
+
+try:
+    import models.experimental
+except Exception:
+    pass
 
 if not DATABASE_URL.startswith("sqlite"):
     from sqlalchemy import text
