@@ -223,7 +223,9 @@ class GeneralizedInvestigationOrchestrator:
             search_res = search_hybrid(db, query, limit=25)
             top_uids = search_res.get("top_results", [])
             if top_uids:
-                hyb_evs = db.query(Event).filter(Event.event_id.in_(top_uids)).all()
+                import uuid
+                uuid_list = [uuid.UUID(str(u)) for u in top_uids if u]
+                hyb_evs = db.query(Event).filter(Event.event_id.in_(uuid_list)).all() if uuid_list else []
                 for e in hyb_evs:
                     eid = str(e.event_id)
                     event_map[eid] = e
@@ -250,6 +252,26 @@ class GeneralizedInvestigationOrchestrator:
                 candidates_by_route["behavioral_mining"].append(e)
                 if eid not in evidence_reasons: evidence_reasons[eid] = []
                 evidence_reasons[eid].append("Active Search Input Pattern")
+
+        # -------------------------------------------------------------
+        # Route 7: Long-Term Memory & Fact Retrieval
+        # -------------------------------------------------------------
+        try:
+            from services.memory import search_similar_memories
+            from models.memories import MemoryEvidence
+            similar_mems = search_similar_memories(db, query, limit=5)
+            for mem in similar_mems:
+                mem_evs = db.query(MemoryEvidence).filter(MemoryEvidence.memory_id == mem.id).all()
+                for me in mem_evs:
+                    eid = str(me.event_id)
+                    linked_ev = db.query(Event).filter(Event.event_id == me.event_id).first()
+                    if linked_ev:
+                        event_map[eid] = linked_ev
+                        event_scores[eid] = event_scores.get(eid, 0.0) + 3.0
+                        if eid not in evidence_reasons: evidence_reasons[eid] = []
+                        evidence_reasons[eid].append(f"Long-term Memory: '{mem.content[:60]}'")
+        except Exception as e:
+            logger.warning(f"Memory route error: {e}")
 
         # -------------------------------------------------------------
         # Evidence Fusion & Deduplication

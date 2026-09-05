@@ -81,19 +81,33 @@ def search_hybrid(
     domain: Optional[str] = None,
     limit: int = 5
 ) -> dict:
-    from services.memory import search_similar_memories
+    from services.embeddings import embed_text, embed_batch
+    import numpy as np
 
-    # 1. Keyword search
+    # 1. Keyword search (Exact / ILIKE)
     keyword_res = search_events(
         db, query, start_time, end_time, domain, event_type=None
     )
     
-    # 2. Vector search (Tasks 6.1 & 6.2)
-    # Ideally temporal filtering is applied directly in vector search too
-    vector_res = search_similar_memories(db, query, limit=limit)
-    
-    # 3. Simple Reciprocal Rank Fusion (RRF) for ranking
-    # Maps content/ID to a score
+    # 2. Direct Event Vector Cosine Search
+    all_events = db.query(Event).all()
+    q_vec = np.array(embed_text(query), dtype=np.float32)
+    q_norm = np.linalg.norm(q_vec) or 1.0
+
+    scored_events: List[Tuple[Event, float]] = []
+    if all_events and q_norm > 0:
+        event_texts = [f"{e.page_title or ''} {e.input_text or ''} {e.url or ''}".strip() for e in all_events]
+        event_vecs = np.array(embed_batch(event_texts), dtype=np.float32)
+        e_norms = np.linalg.norm(event_vecs, axis=1, keepdims=True)
+        e_norms[e_norms == 0.0] = 1.0
+        normalized_events = event_vecs / e_norms
+        sims = np.dot(normalized_events, q_vec / q_norm)
+        
+        for i, ev in enumerate(all_events):
+            scored_events.append((ev, float(sims[i])))
+        scored_events.sort(key=lambda x: x[1], reverse=True)
+
+    # 3. Reciprocal Rank Fusion (RRF)
     rrf_scores = {}
     k = 60
 
@@ -101,8 +115,8 @@ def search_hybrid(
         uid = str(ev.event_id)
         rrf_scores[uid] = rrf_scores.get(uid, 0.0) + 1.0 / (k + rank + 1)
         
-    for rank, mem in enumerate(vector_res):
-        uid = str(mem.id)
+    for rank, (ev, sim) in enumerate(scored_events[:limit * 3]):
+        uid = str(ev.event_id)
         rrf_scores[uid] = rrf_scores.get(uid, 0.0) + 1.0 / (k + rank + 1)
         
     sorted_uids = sorted(rrf_scores.keys(), key=lambda x: rrf_scores[x], reverse=True)
@@ -111,5 +125,5 @@ def search_hybrid(
     return {
         "status": "success",
         "top_results": top_uids,
-        "reranker_needed": False # Task 6.5: Decide Whether Reranking Is Needed
+        "reranker_needed": False
     }

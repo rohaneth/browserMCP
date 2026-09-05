@@ -54,6 +54,12 @@ app.include_router(search.router, prefix="/api/v1")
 app.include_router(memory.router, prefix="/api/v1")
 app.include_router(mcp.router)
 
+from routes import wellbeing as wellbeing_route
+app.include_router(wellbeing_route.router)
+
+from routes import twin as twin_route
+app.include_router(twin_route.router)
+
 # Mount isolated experimental features (Watcher & Self-Discovery)
 try:
     from routes.experimental import router as experimental_router

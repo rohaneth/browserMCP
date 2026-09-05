@@ -15,10 +15,16 @@ from tools import (
     execute_get_timeline,
     execute_get_sessions,
     execute_get_domain_statistics,
-    execute_compare_time_periods,
+    compare_time_periods,
     execute_infer_preferences,
     execute_get_behavioral_patterns,
-    execute_get_evidence
+    execute_get_evidence,
+    execute_classify_browser_event,
+    execute_get_interest_clusters,
+    execute_get_behavioral_anomalies,
+    execute_get_content_recommendations,
+    execute_agentic_investigate,
+    execute_lyzr_orchestrated_investigate
 )
 from auth import verify_token
 
@@ -246,6 +252,76 @@ TOOLS: List[types.Tool] = [
             },
             "required": ["evidence_ids"]
         }
+    ),
+    types.Tool(
+        name="classify_browser_event",
+        description="ML-powered browser event classifier that categorizes web activity (programming/development, education, research, entertainment, shopping, social, news, finance, travel, other) with probability scores.",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "text": {"type": "string", "description": "Text content or search term to classify."},
+                "page_title": {"type": "string", "description": "Optional page title."},
+                "url": {"type": "string", "description": "Optional URL."},
+                "domain": {"type": "string", "description": "Optional domain name."}
+            },
+            "required": ["text"]
+        }
+    ),
+    types.Tool(
+        name="get_interest_clusters",
+        description="Unsupervised ML interest discovery using dense embeddings and K-Means clustering to extract semantic user interest groups and keyword profiles.",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "n_clusters": {"type": "integer", "description": "Number of interest clusters to discover (default: 5).", "default": 5},
+                "min_samples": {"type": "integer", "description": "Minimum event samples required.", "default": 3}
+            }
+        }
+    ),
+    types.Tool(
+        name="get_behavioral_anomalies",
+        description="ML-based behavioral anomaly detection using Isolation Forest to identify unusual browsing hours, rare domains, and anomalous interaction patterns.",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "contamination": {"type": "number", "description": "Expected anomaly contamination proportion (default: 0.05).", "default": 0.05},
+                "limit": {"type": "integer", "description": "Max anomalies to return (default: 10).", "default": 10}
+            }
+        }
+    ),
+    types.Tool(
+        name="get_content_recommendations",
+        description="Content-based recommendation engine suggesting research topics, articles, and learning paths aligned with inferred user interest clusters.",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "limit": {"type": "integer", "description": "Number of recommendations (default: 5).", "default": 5}
+            }
+        }
+    ),
+    types.Tool(
+        name="agentic_investigate",
+        description="Iterative, multi-step Agentic Investigation engine with step budget, tool calling trace, loop protection, and structured machine-readable conclusion.",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "question": {"type": "string", "description": "Complex or multi-hop natural language question to investigate."},
+                "max_iterations": {"type": "integer", "description": "Maximum agent step budget (default: 4).", "default": 4}
+            },
+            "required": ["question"]
+        }
+    ),
+    types.Tool(
+        name="lyzr_orchestrated_investigate",
+        description="Higher-level Lyzr AI Agent orchestration layer coordinating all underlying MCP investigation tools with evidence grounding.",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "question": {"type": "string", "description": "Natural language question for Lyzr Agent to investigate."},
+                "user_id": {"type": "string", "description": "Optional user identifier.", "default": "default_user"}
+            },
+            "required": ["question"]
+        }
     )
 ]
 
@@ -333,6 +409,49 @@ async def handle_call_tool(params: types.CallToolRequestParams, req_ctx=None) ->
         elif name == "get_evidence":
             evidence_ids = arguments.get("evidence_ids", [])
             res = execute_get_evidence(evidence_ids=evidence_ids)
+            return types.CallToolResult(content=[types.TextContent(type="text", text=json.dumps(res, indent=2))])
+
+        elif name == "classify_browser_event":
+            res = execute_classify_browser_event(
+                text=arguments.get("text", ""),
+                page_title=arguments.get("page_title"),
+                url=arguments.get("url"),
+                domain=arguments.get("domain")
+            )
+            return types.CallToolResult(content=[types.TextContent(type="text", text=json.dumps(res, indent=2))])
+
+        elif name == "get_interest_clusters":
+            res = execute_get_interest_clusters(
+                n_clusters=arguments.get("n_clusters", 5),
+                min_samples=arguments.get("min_samples", 3)
+            )
+            return types.CallToolResult(content=[types.TextContent(type="text", text=json.dumps(res, indent=2))])
+
+        elif name == "get_behavioral_anomalies":
+            res = execute_get_behavioral_anomalies(
+                contamination=arguments.get("contamination", 0.05),
+                limit=arguments.get("limit", 10)
+            )
+            return types.CallToolResult(content=[types.TextContent(type="text", text=json.dumps(res, indent=2))])
+
+        elif name == "get_content_recommendations":
+            res = execute_get_content_recommendations(
+                limit=arguments.get("limit", 5)
+            )
+            return types.CallToolResult(content=[types.TextContent(type="text", text=json.dumps(res, indent=2))])
+
+        elif name == "agentic_investigate":
+            res = execute_agentic_investigate(
+                question=arguments.get("question", ""),
+                max_iterations=arguments.get("max_iterations", 4)
+            )
+            return types.CallToolResult(content=[types.TextContent(type="text", text=json.dumps(res, indent=2))])
+
+        elif name == "lyzr_orchestrated_investigate":
+            res = execute_lyzr_orchestrated_investigate(
+                question=arguments.get("question", ""),
+                user_id=arguments.get("user_id", "default_user")
+            )
             return types.CallToolResult(content=[types.TextContent(type="text", text=json.dumps(res, indent=2))])
 
         else:

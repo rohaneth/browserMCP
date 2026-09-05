@@ -590,3 +590,228 @@ def execute_get_evidence(evidence_ids: List[str]) -> Dict[str, Any]:
         }
     finally:
         db.close()
+
+
+def execute_classify_browser_event(
+    text: str,
+    page_title: Optional[str] = None,
+    url: Optional[str] = None,
+    domain: Optional[str] = None
+) -> Dict[str, Any]:
+    """
+    Classifies a browser event using the trained ML Behavioral Classifier.
+    """
+    from services.classifier import BrowserEventClassifier
+    result = BrowserEventClassifier.classify(
+        text=text,
+        page_title=page_title,
+        url=url,
+        domain=domain
+    )
+    return {
+        "category": result.category,
+        "confidence": result.confidence,
+        "probabilities": result.probabilities,
+        "features_used": result.features_used
+    }
+
+
+def execute_get_interest_clusters(
+    n_clusters: int = 5,
+    min_samples: int = 3
+) -> Dict[str, Any]:
+    """
+    Discovers unsupervised semantic clusters of user interests using K-Means and embeddings.
+    """
+    db = get_db_session()
+    try:
+        from services.clustering import InterestClusterEngine
+        clusters = InterestClusterEngine.discover_clusters(
+            db=db,
+            n_clusters=n_clusters,
+            min_samples=min_samples
+        )
+        return {
+            "total_clusters_found": len(clusters),
+            "clusters": [
+                {
+                    "cluster_id": c.cluster_id,
+                    "label": c.label,
+                    "top_keywords": c.top_keywords,
+                    "event_count": c.event_count,
+                    "representative_urls": c.representative_urls,
+                    "coherence_score": c.coherence_score
+                }
+                for c in clusters
+            ]
+        }
+    finally:
+        db.close()
+
+
+def execute_get_behavioral_anomalies(
+    contamination: float = 0.05,
+    limit: int = 10
+) -> Dict[str, Any]:
+    """
+    Detects behavioral anomalies across browsing activity using Isolation Forest.
+    """
+    db = get_db_session()
+    try:
+        from services.anomaly_detection import BehavioralAnomalyDetector
+        anomalies = BehavioralAnomalyDetector.detect_anomalies(
+            db=db,
+            contamination=contamination,
+            limit=limit
+        )
+        return {
+            "total_anomalies_detected": len(anomalies),
+            "anomalies": [
+                {
+                    "is_anomaly": a.is_anomaly,
+                    "anomaly_score": a.anomaly_score,
+                    "reasons": a.anomaly_reasons,
+                    "unusual_dimensions": a.unusual_dimensions,
+                    "event_id": a.event_id,
+                    "timestamp": a.timestamp.isoformat() if a.timestamp else None
+                }
+                for a in anomalies
+            ]
+        }
+    finally:
+        db.close()
+
+
+def execute_get_content_recommendations(
+    limit: int = 5
+) -> Dict[str, Any]:
+    """
+    Generates content-based topic and learning recommendations from inferred interest profiles.
+    """
+    db = get_db_session()
+    try:
+        from services.recommendation import RecommendationEngine
+        recommendations = RecommendationEngine.get_recommendations(
+            db=db,
+            limit=limit
+        )
+        return {
+            "total_recommendations": len(recommendations),
+            "recommendations": [
+                {
+                    "topic": r.topic,
+                    "rationale": r.rationale,
+                    "relevance_score": r.relevance_score,
+                    "category": r.category,
+                    "related_interests": r.related_interests
+                }
+                for r in recommendations
+            ]
+        }
+    finally:
+        db.close()
+
+
+def execute_agentic_investigate(
+    question: str,
+    max_iterations: int = 4
+) -> Dict[str, Any]:
+    """
+    Executes a multi-step iterative agentic investigation with tool call tracking and structured outputs.
+    """
+    db = get_db_session()
+    try:
+        from services.agentic_investigator import AgenticInvestigator
+        structured_output = AgenticInvestigator.run_agentic_loop(
+            db=db,
+            query=question,
+            max_iterations=max_iterations
+        )
+        return {
+            "query": structured_output.query,
+            "confidence": structured_output.confidence.value,
+            "direct_answer": structured_output.direct_answer,
+            "key_findings": structured_output.key_findings,
+            "citations_count": len(structured_output.citations),
+            "citations": [
+                {
+                    "event_id": c.event_id,
+                    "timestamp": c.timestamp.isoformat() if c.timestamp else None,
+                    "url": c.url,
+                    "title": c.title,
+                    "snippet": c.snippet,
+                    "score": c.score
+                }
+                for c in structured_output.citations
+            ],
+            "trace": {
+                "total_steps": structured_output.trace.total_steps,
+                "tools_used": structured_output.trace.tools_used,
+                "stop_reason": structured_output.trace.stop_reason,
+                "step_history": [
+                    {
+                        "step_number": s.step_number,
+                        "tool_name": s.tool_name,
+                        "parameters": s.parameters,
+                        "thought_rationale": s.thought_rationale,
+                        "observation_summary": s.observation_summary,
+                        "evidence_count_gained": s.evidence_count_gained
+                    }
+                    for s in structured_output.trace.step_history
+                ]
+            } if structured_output.trace else None,
+            "structured_metadata": structured_output.structured_metadata
+        }
+    finally:
+        db.close()
+
+
+def execute_lyzr_orchestrated_investigate(
+    question: str,
+    user_id: Optional[str] = "default_user"
+) -> Dict[str, Any]:
+    """
+    Executes higher-level Lyzr Agent orchestration over all underlying MCP investigation capabilities.
+    """
+    db = get_db_session()
+    try:
+        from services.lyzr_agent import LyzrAgentOrchestrator
+        output = LyzrAgentOrchestrator.run_agent(db=db, query=question, user_id=user_id)
+        return {
+            "query": output.query,
+            "confidence": output.confidence.value,
+            "direct_answer": output.direct_answer,
+            "key_findings": output.key_findings,
+            "citations_count": len(output.citations),
+            "citations": [
+                {
+                    "event_id": c.event_id,
+                    "timestamp": c.timestamp.isoformat() if c.timestamp else None,
+                    "url": c.url,
+                    "title": c.title,
+                    "snippet": c.snippet,
+                    "score": c.score
+                }
+                for c in output.citations
+            ],
+            "trace": {
+                "total_steps": output.trace.total_steps,
+                "tools_used": output.trace.tools_used,
+                "stop_reason": output.trace.stop_reason,
+                "step_history": [
+                    {
+                        "step_number": s.step_number,
+                        "tool_name": s.tool_name,
+                        "parameters": s.parameters,
+                        "thought_rationale": s.thought_rationale,
+                        "observation_summary": s.observation_summary,
+                        "evidence_count_gained": s.evidence_count_gained
+                    }
+                    for s in output.trace.step_history
+                ]
+            } if output.trace else None,
+            "structured_metadata": output.structured_metadata
+        }
+    finally:
+        db.close()
+

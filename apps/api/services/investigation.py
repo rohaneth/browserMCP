@@ -134,6 +134,14 @@ def run_investigation(db: Session, query: str) -> Tuple[Investigation, List[Evid
         pref_data = retrieval_bundle["pref_data"]
         inf_result = retrieval_bundle["inf_result"]
 
+        # Neural Cross-Encoder Reranker Step
+        try:
+            from services.reranker import NeuralReranker
+            if NeuralReranker.is_enabled() and len(evidence_list) > 1:
+                evidence_list = NeuralReranker.rerank_evidence(query, evidence_list, top_n=30)
+        except Exception as e:
+            logger.warning(f"Neural reranker warning: {e}")
+
         is_strict_entity_check = any(
             normalize_string(query).startswith(p) for p in [
                 "did i search", "have i searched", "did i visit", "have i visited",

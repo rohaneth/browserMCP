@@ -6,20 +6,21 @@ from typing import List
 from models.events import Event
 from models.memories import Memory, MemoryEvidence
 from models.sessions import BrowserSession as SessionModel
+from services.embeddings import embed_text, embed_batch
+from services.vector_store import VectorStore
 
 logger = logging.getLogger(__name__)
 
-import os
 
 def generate_embedding(text: str) -> List[float]:
-    embedding = [0.0] * 384
-    if text:
-        for i, char in enumerate(text[:384]):
-            embedding[i] = float((ord(char) * 17) % 100) / 100.0
-    return embedding
+    """Generates 384-dimensional dense semantic embedding."""
+    return embed_text(text)
 
-# Task 5.2: Memory Extraction
+
 def extract_memories_from_session(db: Session, session_id: UUID) -> List[Memory]:
+    """
+    Extracts atomic memories from session events and indexes with real dense embeddings.
+    """
     session = db.query(SessionModel).filter(SessionModel.id == session_id).first()
     if not session:
         return []
@@ -28,58 +29,37 @@ def extract_memories_from_session(db: Session, session_id: UUID) -> List[Memory]
     if not events:
         return []
 
-    # Basic extraction: finding search events to form facts.
-    # Phase 5 calls for LLM usage later, but starting deterministic.
-    search_events = [e for e in events if e.event_type == 'search_submitted']
-    
-    memories = []
-    for se in search_events:
-        content = f"User searched for: {se.input_text or se.page_title}"
-        memory = Memory(
-            content=content,
-            embedding=generate_embedding(content),
-            embedding_model="mock-all-MiniLM-L6-v2",
-            type="FACT"
-        )
-        db.add(memory)
-        db.commit()
-        db.refresh(memory)
-        
+    search_events = [e for e in events if e.event_type in ('search_submitted', 'page_loaded')]
+    if not search_events:
+        return []
+
+    items_to_index = []
+    event_mapping = []
+
+    for se in search_events[:10]:
+        title = se.page_title or ""
+        inp = se.input_text or ""
+        content = f"User searched or viewed: {inp or title} on {se.domain or 'web'}"
+        items_to_index.append({"content": content, "type": "FACT"})
+        event_mapping.append(se)
+
+    created_memories = VectorStore.index_texts(db, items_to_index)
+
+    # Link evidence junction
+    for mem, se in zip(created_memories, event_mapping):
         evidence = MemoryEvidence(
-            memory_id=memory.id,
+            memory_id=mem.id,
             event_id=se.event_id
         )
         db.add(evidence)
-        db.commit()
-        
-        memories.append(memory)
-        
-    return memories
+    db.commit()
 
-# Task 5.5: Semantic Search
+    return created_memories
+
+
 def search_similar_memories(db: Session, query: str, limit: int = 5) -> List[Memory]:
-    query_embedding = generate_embedding(query)
-    
-    is_sqlite = db.bind.dialect.name == "sqlite"
-    
-    if is_sqlite:
-        import math
-        memories = db.query(Memory).all()
-        if not memories:
-            return []
-            
-        def l2_dist(v1, v2):
-            if not v1 or not v2: return 999.0
-            if isinstance(v1, str):
-                import json
-                try: v1 = json.loads(v1)
-                except: return 999.0
-            if len(v1) != len(v2): return 999.0
-            return math.sqrt(sum((a - b) ** 2 for a, b in zip(v1, v2)))
-
-        memories.sort(key=lambda m: l2_dist(m.embedding, query_embedding))
-        return memories[:limit]
-    else:
-        # using pgvector L2 distance operator `<->`
-        results = db.query(Memory).order_by(Memory.embedding.l2_distance(query_embedding)).limit(limit).all()
-        return results
+    """
+    Real vector similarity search using cosine distance / pgvector.
+    """
+    scored_results = VectorStore.search_similar(db, query, limit=limit)
+    return [mem for mem, score in scored_results]

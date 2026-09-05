@@ -177,7 +177,13 @@ class BrowserWatcher:
 
                 ts_str = data.get("timestamp")
                 url = data.get("url", "")
-                event_type = data.get("event") or data.get("type") or "unknown"
+                raw_event = data.get("event") or data.get("type") or "unknown"
+                event_type_map = {
+                    "input": "input_submitted",
+                    "search": "search_submitted",
+                    "form": "form_submitted",
+                }
+                event_type = event_type_map.get(raw_event, raw_event)
                 page_title = data.get("pageTitle") or data.get("title") or ""
                 input_text = data.get("input") or data.get("text") or ""
                 content = data.get("content", "")
@@ -233,30 +239,39 @@ class BrowserWatcher:
             db.close()
 
     def _process_new_events_cycle(self):
-        """Inspects newly arrived events without invoking LLMs on every single event."""
+        """Inspects newly arrived events and scans for interest signals without invoking heavy LLMs."""
         db = SessionLocal()
         try:
             state = self._get_or_create_state(db)
 
-            # Query events newer than last processed timestamp
+            # Query events for lightweight analysis
             query = db.query(Event)
             if state.last_processed_timestamp:
                 query = query.filter(Event.timestamp > state.last_processed_timestamp)
 
             new_events = query.order_by(Event.timestamp.asc()).limit(100).all()
+            
+            # If no newer events, evaluate recent window (last 50 events) if alert table is empty
             if not new_events:
-                return
+                existing_alerts_count = db.query(WatcherAlert).count()
+                if existing_alerts_count == 0:
+                    new_events = db.query(Event).order_by(Event.timestamp.desc()).limit(50).all()
+                    if new_events:
+                        new_events.reverse()
+                else:
+                    return
 
-            # Lightweight pattern detection
+            # Multi-query phrase & pattern detection
             alerts = self._analyze_events_lightweight(db, new_events)
 
             for alert in alerts:
                 db.add(alert)
                 state.total_alerts_triggered += 1
 
-            state.last_processed_timestamp = new_events[-1].timestamp
-            state.last_processed_event_id = new_events[-1].event_id
-            state.total_events_observed += len(new_events)
+            if new_events:
+                state.last_processed_timestamp = new_events[-1].timestamp
+                state.last_processed_event_id = new_events[-1].event_id
+                state.total_events_observed += len(new_events)
             db.commit()
 
         finally:
@@ -264,20 +279,27 @@ class BrowserWatcher:
 
     def _analyze_events_lightweight(self, db: Session, events: List[Event]) -> List[WatcherAlert]:
         """
-        Lightweight heuristic rule evaluation:
-        1. High concentration / burst of queries on a specific new technical topic or language.
-        2. Domain cluster switch (e.g. pivoting into research or entertainment).
-        3. Media consumption or shopping shift detection.
+        Lightweight multi-query rule evaluation:
+        1. Extract exact words/phrases appearing in >= 2 distinct search queries.
+        2. Ignore navigation terms (login, signup, close, etc.).
+        3. Emit strictly factual interest signals with exact supporting query citations.
         """
         alerts = []
         if len(events) < 2:
             return alerts
 
-        # Collect searches & domains
-        searches = []
+        STOP_WORDS = {
+            "the", "a", "an", "and", "or", "for", "of", "in", "on", "at", "to", "from",
+            "is", "are", "was", "were", "vs", "not", "with", "without", "what", "how",
+            "why", "can", "best", "when", "who", "does", "do", "you", "someone", "many",
+            "sign", "up", "login", "close", "home", "back", "google", "search", "youtube",
+            "under", "like", "which", "will", "exist", "more", "much", "need"
+        }
+
+        # Collect searches & event mapping
+        searches_map = {}  # query_text -> list of event_ids
         domains = []
         titles = []
-        event_ids = [str(e.event_id) for e in events]
 
         for e in events:
             if e.domain:
@@ -285,10 +307,68 @@ class BrowserWatcher:
             if e.page_title:
                 titles.append(e.page_title.lower())
             inp = e.input_text or extract_url_search_params(e.url)
-            if inp:
-                searches.append(inp.lower())
+            if inp and len(inp.strip()) > 3:
+                q_clean = inp.strip().lower()
+                # Ignore pure navigation queries
+                if q_clean in {"sign up", "sign in", "login", "close", "home", "back"}:
+                    continue
+                if q_clean not in searches_map:
+                    searches_map[q_clean] = []
+                searches_map[q_clean].append(str(e.event_id))
 
-        # Check for domain concentration
+        # Check for multi-query interest phrases (appearing in >= 2 distinct queries)
+        queries = list(searches_map.keys())
+        phrase_to_queries = {}
+
+        for q in queries:
+            words = re.findall(r'[a-zA-Z0-9]+', q)
+            seen_in_q = set()
+            # 1-grams
+            for w in words:
+                if len(w) > 2 and w not in STOP_WORDS:
+                    seen_in_q.add(w)
+            # 2-grams
+            for i in range(len(words) - 1):
+                w1, w2 = words[i], words[i+1]
+                if w1 not in STOP_WORDS and w2 not in STOP_WORDS:
+                    seen_in_q.add(f"{w1} {w2}")
+
+            for phrase in seen_in_q:
+                if phrase not in phrase_to_queries:
+                    phrase_to_queries[phrase] = []
+                phrase_to_queries[phrase].append(q)
+
+        # Sort phrases by number of distinct supporting queries
+        sorted_phrases = sorted(
+            [(p, qs) for p, qs in phrase_to_queries.items() if len(qs) >= 2],
+            key=lambda x: len(x[1]),
+            reverse=True
+        )
+
+        emitted_topics = set()
+        for phrase, sup_queries in sorted_phrases[:5]:
+            topic_label = phrase.title()
+            if topic_label in emitted_topics:
+                continue
+
+            # Gather event IDs from supporting queries
+            sup_event_ids = []
+            for sq in sup_queries:
+                sup_event_ids.extend(searches_map.get(sq, []))
+
+            # Deduplicate while preserving order
+            unique_sup_queries = list(dict.fromkeys(sup_queries))
+            unique_sup_events = list(dict.fromkeys(sup_event_ids))
+
+            alerts.append(WatcherAlert(
+                alert_type="interest_signal",
+                title=f"Interest Signal: {topic_label}",
+                summary=f"Detected repeated search signals related to '{topic_label}' across {len(unique_sup_queries)} queries: {unique_sup_queries[:3]}",
+                supporting_event_ids=unique_sup_events[:10]
+            ))
+            emitted_topics.add(topic_label)
+
+        # Domain burst detection
         dom_counts = Counter(domains)
         if dom_counts:
             top_dom, top_count = dom_counts.most_common(1)[0]
@@ -297,30 +377,7 @@ class BrowserWatcher:
                     alert_type="activity_burst",
                     title=f"Activity Burst on {top_dom}",
                     summary=f"Detected a concentrated stream of {top_count} events on {top_dom}.",
-                    supporting_event_ids=event_ids[:10]
+                    supporting_event_ids=[str(e.event_id) for e in events[:10]]
                 ))
-
-        # Check for search topic patterns
-        if searches:
-            joined_searches = " ".join(searches)
-            for kw in ["python", "rust", "docker", "fastapi", "react", "kubernetes", "java", "sql", "vivobook", "laptop"]:
-                if kw in joined_searches:
-                    alerts.append(WatcherAlert(
-                        alert_type="interest_signal",
-                        title=f"Active Exploration of {kw.capitalize()}",
-                        summary=f"Detected repeated search signals related to {kw.capitalize()} in recent user queries: {searches[:3]}",
-                        supporting_event_ids=event_ids[:10]
-                    ))
-                    break
-
-        # Check for entertainment stream (e.g. YouTube Standup or Video sessions)
-        joined_titles = " ".join(titles)
-        if "samay raina" in joined_titles or "standup" in joined_titles or "special" in joined_titles:
-            alerts.append(WatcherAlert(
-                alert_type="entertainment_session",
-                title="Entertainment & Media Playback Detected",
-                summary="Detected active video consumption and entertainment streaming session.",
-                supporting_event_ids=event_ids[:10]
-            ))
 
         return alerts

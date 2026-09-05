@@ -59,9 +59,13 @@ def sync_events_log_to_db(force: bool = False) -> int:
 
     db = SessionLocal()
     added_count = 0
+    deleted_count = 0
     try:
         with open(log_path, 'r', encoding='utf-8') as f:
             lines = f.readlines()
+
+        valid_events_data = []
+        valid_keys = set()
 
         for line in lines:
             line = line.strip()
@@ -74,7 +78,14 @@ def sync_events_log_to_db(force: bool = False) -> int:
 
             ts_str = data.get("timestamp")
             url = data.get("url", "")
-            event_type = data.get("event") or data.get("type") or "unknown"
+            raw_event = data.get("event") or data.get("type") or "unknown"
+            # Normalize event types to valid EventType enum values
+            event_type_map = {
+                "input": "input_submitted",
+                "search": "search_submitted",
+                "form": "form_submitted",
+            }
+            event_type = event_type_map.get(raw_event, raw_event)
             page_title = data.get("pageTitle") or data.get("title") or ""
             input_text = data.get("input") or data.get("text") or data.get("query") or ""
             content = data.get("content", "")
@@ -100,37 +111,47 @@ def sync_events_log_to_db(force: bool = False) -> int:
                 if extr:
                     input_text = extr
 
-            # Check if event already exists in DB
-            existing = db.query(Event).filter(
-                Event.timestamp == dt,
-                Event.event_type == event_type,
-                Event.url == url
-            ).first()
+            ev_key = (dt.isoformat(), event_type, url)
+            valid_keys.add(ev_key)
+            valid_events_data.append((dt, event_type, url, domain, page_title, content, input_text, data))
 
-            if not existing:
-                new_ev = Event(
-                    event_id=uuid.uuid4(),
-                    timestamp=dt,
-                    event_type=event_type,
-                    url=url,
-                    canonical_url=url,
-                    domain=domain,
-                    page_title=page_title,
-                    content=content,
-                    input_text=input_text,
-                    metadata_={
-                        k: v for k, v in data.items()
-                        if k not in {"timestamp", "event", "type", "pageTitle", "title", "input", "text", "query", "url", "content"}
-                    },
-                    source="events_log_auto_sync",
-                    schema_version=1
-                )
-                db.add(new_ev)
-                added_count += 1
+        # Replace table events with clean mirror of events.log
+        db.query(Event).delete()
 
-        if added_count > 0:
+        for dt, event_type, url, domain, page_title, content, input_text, data in valid_events_data:
+            new_ev = Event(
+                event_id=uuid.uuid4(),
+                timestamp=dt,
+                event_type=event_type,
+                url=url,
+                canonical_url=url,
+                domain=domain,
+                page_title=page_title,
+                content=content,
+                input_text=input_text,
+                metadata_={
+                    k: v for k, v in data.items()
+                    if k not in {"timestamp", "event", "type", "pageTitle", "title", "input", "text", "query", "url", "content"}
+                },
+                source="events_log_auto_sync",
+                schema_version=1
+            )
+            db.add(new_ev)
+            added_count += 1
+
+        db.commit()
+        
+        # Automatically assign all events to BrowserSession clusters
+        try:
+            from models.sessions import BrowserSession
+            from services.sessions import assign_unassigned_events_to_sessions
+            db.query(BrowserSession).delete()
             db.commit()
-            logger.info(f"Auto-synchronized {added_count} new events from {log_path} into DB.")
+            assign_unassigned_events_to_sessions(db, threshold_minutes=25)
+        except Exception as sess_err:
+            logger.warning(f"Session assignment after sync warning: {sess_err}")
+
+        logger.info(f"Auto-synchronized events.log mirror: {added_count} events synced to DB.")
     except Exception as e:
         logger.error(f"Error during events.log auto-synchronization: {e}", exc_info=True)
     finally:

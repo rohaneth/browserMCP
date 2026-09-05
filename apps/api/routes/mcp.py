@@ -19,7 +19,12 @@ from tools import (
     execute_compare_time_periods,
     execute_infer_preferences,
     execute_get_behavioral_patterns,
-    execute_get_evidence
+    execute_get_evidence,
+    execute_classify_browser_event,
+    execute_get_interest_clusters,
+    execute_get_behavioral_anomalies,
+    execute_get_content_recommendations,
+    execute_agentic_investigate
 )
 
 router = APIRouter(prefix="/mcp", tags=["MCP Server"])
@@ -148,6 +153,64 @@ MCP_TOOL_METADATA = [
             },
             "required": ["evidence_ids"]
         }
+    },
+    {
+        "name": "classify_browser_event",
+        "description": "ML-powered browser event classifier that categorizes web activity (programming/development, education, research, entertainment, shopping, social, news, finance, travel, other) with probability scores.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "text": {"type": "string", "description": "Text content or search term to classify."},
+                "page_title": {"type": "string", "description": "Optional page title."},
+                "url": {"type": "string", "description": "Optional URL."},
+                "domain": {"type": "string", "description": "Optional domain name."}
+            },
+            "required": ["text"]
+        }
+    },
+    {
+        "name": "get_interest_clusters",
+        "description": "Unsupervised ML interest discovery using dense embeddings and K-Means clustering to extract semantic user interest groups and keyword profiles.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "n_clusters": {"type": "integer", "description": "Number of interest clusters to discover (default: 5).", "default": 5},
+                "min_samples": {"type": "integer", "description": "Minimum event samples required.", "default": 3}
+            }
+        }
+    },
+    {
+        "name": "get_behavioral_anomalies",
+        "description": "ML-based behavioral anomaly detection using Isolation Forest to identify unusual browsing hours, rare domains, and anomalous interaction patterns.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "contamination": {"type": "number", "description": "Expected anomaly contamination proportion (default: 0.05).", "default": 0.05},
+                "limit": {"type": "integer", "description": "Max anomalies to return (default: 10).", "default": 10}
+            }
+        }
+    },
+    {
+        "name": "get_content_recommendations",
+        "description": "Content-based recommendation engine suggesting research topics, articles, and learning paths aligned with inferred user interest clusters.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "limit": {"type": "integer", "description": "Number of recommendations (default: 5).", "default": 5}
+            }
+        }
+    },
+    {
+        "name": "agentic_investigate",
+        "description": "Iterative, multi-step Agentic Investigation engine with step budget, tool calling trace, loop protection, and structured machine-readable conclusion.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "question": {"type": "string", "description": "Complex or multi-hop natural language question to investigate."},
+                "max_iterations": {"type": "integer", "description": "Maximum agent step budget (default: 4).", "default": 4}
+            },
+            "required": ["question"]
+        }
     }
 ]
 
@@ -268,6 +331,32 @@ async def call_mcp_tool(request: Request):
         elif name == "get_evidence":
             res = execute_get_evidence(
                 evidence_ids=arguments.get("evidence_ids", [])
+            )
+        elif name == "classify_browser_event":
+            res = execute_classify_browser_event(
+                text=arguments.get("text", ""),
+                page_title=arguments.get("page_title"),
+                url=arguments.get("url"),
+                domain=arguments.get("domain")
+            )
+        elif name == "get_interest_clusters":
+            res = execute_get_interest_clusters(
+                n_clusters=arguments.get("n_clusters", 5),
+                min_samples=arguments.get("min_samples", 3)
+            )
+        elif name == "get_behavioral_anomalies":
+            res = execute_get_behavioral_anomalies(
+                contamination=arguments.get("contamination", 0.05),
+                limit=arguments.get("limit", 10)
+            )
+        elif name == "get_content_recommendations":
+            res = execute_get_content_recommendations(
+                limit=arguments.get("limit", 5)
+            )
+        elif name == "agentic_investigate":
+            res = execute_agentic_investigate(
+                question=arguments.get("question", ""),
+                max_iterations=arguments.get("max_iterations", 4)
             )
         else:
             raise HTTPException(status_code=404, detail=f"Tool '{name}' not found.")

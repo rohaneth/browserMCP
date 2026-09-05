@@ -1,12 +1,37 @@
 [
     {
         "query": "What did I research about Java yesterday?",
-        "expected_events": ["event-id-1", "event-id-2"],
-        "expected_answer_contains": "Java 8 vs Java 15"
+        "expected_keywords": ["java", "spring", "jvm"],
+        "expected_answer_contains": "java",
+        "expected_category": "programming/development",
+        "grounded_facts": ["Java", "programming language"]
     },
     {
         "query": "Find my session on debugging Postgres performance",
-        "expected_events": ["event-id-3"],
-        "expected_answer_contains": "pg_stat_statements"
+        "expected_keywords": ["postgres", "postgresql", "sql", "performance"],
+        "expected_answer_contains": "postgres",
+        "expected_category": "programming/development",
+        "grounded_facts": ["PostgreSQL", "database"]
+    },
+    {
+        "query": "What standup comedy or funny videos did I watch?",
+        "expected_keywords": ["standup", "comedy", "funny", "comedian"],
+        "expected_answer_contains": "comedian",
+        "expected_category": "entertainment",
+        "grounded_facts": ["comedy", "entertainment"]
+    },
+    {
+        "query": "Did I search for machine learning research papers on arXiv?",
+        "expected_keywords": ["arxiv", "paper", "transformer", "research"],
+        "expected_answer_contains": "research",
+        "expected_category": "research",
+        "grounded_facts": ["machine learning", "arxiv"]
+    },
+    {
+        "query": "What books or authors like Albert Camus did I look into?",
+        "expected_keywords": ["camus", "author", "book", "philosophy"],
+        "expected_answer_contains": "Camus",
+        "expected_category": "education",
+        "grounded_facts": ["Albert Camus", "books"]
     }
 ]

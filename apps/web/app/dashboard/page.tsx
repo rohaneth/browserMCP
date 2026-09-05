@@ -718,6 +718,8 @@ export default function DashboardPage() {
             <span className="brand-badge">Intelligence</span>
           </div>
           <div className="nav-links">
+            <a href="/twin" className="nav-button">🧬 Digital Twin</a>
+            <a href="/wellbeing" className="nav-button">🌿 Wellbeing</a>
             <a href="/chat" className="nav-button">💬 Chat View</a>
             <a href="/dashboard" className="nav-button active">📊 Dashboard</a>
             <a href="/" className="nav-button">📜 Raw Timeline</a>
